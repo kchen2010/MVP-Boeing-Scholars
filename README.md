@@ -1,3 +1,7 @@
-"MMVP" - Matt
-Frame by Frame using Yolo 9 
-TODO: Run just segmentation over video using Sam2 and develop sliding window inpainting model.
+## "MMVP" — Matt
+
+**Frame-by-Frame Processing using YOLOv9**
+
+**TODO:**
+- Run segmentation over video using **SAM2**.
+- Develop a **sliding-window inpainting model**.
