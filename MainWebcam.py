@@ -1,15 +1,21 @@
 """
-Hybrid Spatial-Temporal Inpainting Pipeline
-1. LaMa: Spatial inpainting to fill holes using surrounding context
-2. FuseFormer: Temporal refinement for consistency across frames
+Spatial Inpainting Pipeline
+1. YOLO: Object detection
+2. EDGE-TAM: Segmentation from bounding boxes
+3. LaMa: Spatial inpainting to fill holes using surrounding context
 """
 
 import cv2
 import torch
 import numpy as np
-import time  # <--- 1. IMPORT TIME
+import time
+import sys
+import os
 from ultralytics import YOLO
-from collections import deque
+
+# Add EdgeTAM to path if it exists
+if os.path.exists('EdgeTAM'):
+    sys.path.insert(0, 'EdgeTAM')
 
 # Check for LaMa
 try:
@@ -20,63 +26,94 @@ except ImportError:
     LAMA_AVAILABLE = False
     exit(1)
 
-# Import FuseFormer
-from FuseFormer_OM import InpaintGenerator
+# Check for EDGE-TAM
+try:
+    from sam2.build_sam import build_sam2
+    from sam2.sam2_image_predictor import SAM2ImagePredictor
+    EDGETAM_AVAILABLE = True
+except ImportError:
+    EDGETAM_AVAILABLE = False
+    print("⚠ EDGE-TAM not available. Install EdgeTAM or ensure EdgeTAM folder is in the path.")
+    print("   For now, using bounding box fallback for segmentation.")
 
 # --- Constants ---
-YOLO_MODEL = 'yolov8s-seg.pt' 
-FUSEFORMER_WEIGHTS = 'checkpoints/fuseformer.pth'
-VIDEO_SOURCE = 0 #webcam
-# VIDEO_SOURCE = ['content/TestVideo1.mp4']
+YOLO_MODEL = 'yolo11s.pt'
+#VIDEO_SOURCE = 0  # Use 0 for webcam, or provide path to .mp4 file (e.g., 'content/TestVideo1.mp4')
+VIDEO_SOURCE = 'content/TestVideo2.mp4'  # Uncomment to use video file
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# Processing parameters
 MODEL_IN_H, MODEL_IN_W = 240, 432
-TEMPORAL_WINDOW = 5  # Frames for FuseFormer temporal consistency
-USE_LAMA = True      # Toggle spatial inpainting
-USE_FUSEFORMER = False # Toggle temporal refinement
+USE_LAMA = True
+DEBUG_MODE = False
 
-DEBUG_MODE = False   # Set to False for clean output
-
-print(f"=== Hybrid Inpainting System ===")
+print(f"=== Spatial Inpainting System ===")
 print(f"Device: {DEVICE}")
-print(f"Pipeline: YOLO -> LaMa (spatial) -> FuseFormer (temporal)")
+print(f"Pipeline: YOLO (detection) -> EDGE-TAM (segmentation) -> LaMa (spatial)")
 
-# 1. Load YOLO
-print("Loading YOLO...")
+# 1. Load YOLO (detection-only)
+print("Loading YOLO (detection-only)...")
 yolo = YOLO(YOLO_MODEL)
 yolo.to(DEVICE)
 
-# 2. Load LaMa
+# 2. Load EDGE-TAM for segmentation
+print("Loading EDGE-TAM...")
+edgetam_predictor = None
+
+EDGETAM_ROOT = 'EdgeTAM'
+checkpoint_path = os.path.join(EDGETAM_ROOT, "checkpoints", "edgetam.pt")
+model_cfg = "edgetam.yaml"
+
+if not os.path.exists(checkpoint_path):
+    print(f"\n[ERROR] Model weights not found at: {checkpoint_path}")
+    print("Action Required: Download 'edgetam.pt' from the GitHub link and place it in the checkpoints folder.")
+    sys.exit(1)
+
+print(f"Loading EdgeTAM from: {checkpoint_path}")
+
+try:
+    model = build_sam2(model_cfg, checkpoint_path, device=DEVICE)
+    edgetam_predictor = SAM2ImagePredictor(model)
+    print("✓ EdgeTAM loaded successfully!")
+    EDGETAM_AVAILABLE = True
+
+except FileNotFoundError:
+    # Fallback: Try providing the absolute path to the config if the simple name fails
+    try:
+        print("   'edgetam.yaml' not found in path, trying absolute path...")
+        abs_config_path = os.path.join(EDGETAM_ROOT, "sam2", "configs", "edgetam.yaml")
+        model = build_sam2(abs_config_path, checkpoint_path, device=DEVICE)
+        edgetam_predictor = SAM2ImagePredictor(model)
+        print("✓ EdgeTAM loaded successfully (using absolute config path)!")
+        EDGETAM_AVAILABLE = True
+    except Exception as e:
+        print(f"\n[CRITICAL FAILURE] Could not load config: {e}")
+        EDGETAM_AVAILABLE = False
+
+# 3. Load LaMa
 print("Loading LaMa...")
 lama = SimpleLama()
 
-# 3. Load FuseFormer
-print("Loading FuseFormer...")
-fuseformer = InpaintGenerator(init_weights=False)
-checkpoint = torch.load(FUSEFORMER_WEIGHTS, map_location=DEVICE)
-
-if isinstance(checkpoint, dict):
-    state_dict = checkpoint.get('netG', checkpoint.get('state_dict', checkpoint))
-else:
-    state_dict = checkpoint
-
-fuseformer.load_state_dict(state_dict, strict=False)
-fuseformer.to(DEVICE)
-fuseformer.eval()
-
 print("✓ All models loaded\n")
 
-# 4. Initialize video and buffers
-cap = cv2.VideoCapture(VIDEO_SOURCE) 
+# 4. Initialize video capture
+is_video_file = isinstance(VIDEO_SOURCE, str) and os.path.exists(VIDEO_SOURCE)
+cap = cv2.VideoCapture(VIDEO_SOURCE)
 
-# Frame buffer for temporal processing
-frame_buffer = deque(maxlen=TEMPORAL_WINDOW)
-former_attn = torch.Tensor().to(DEVICE)
+if not cap.isOpened():
+    print(f"Error: Could not open video source: {VIDEO_SOURCE}")
+    sys.exit(1)
 
-print("Press 'q' to quit, 'd' to toggle debug")
-print("Press '1' to toggle LaMa, '2' to toggle FuseFormer")
+if is_video_file:
+    print(f"Processing video file: {VIDEO_SOURCE}")
+    original_fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"Video properties: {total_frames} frames @ {original_fps:.2f} FPS")
+else:
+    print("Using webcam input")
+
+print("\nPress 'q' to quit, 'd' to toggle debug")
+print("Press '1' to toggle LaMa")
 print("Press 's' to save current frame\n")
 
 frame_count = 0
@@ -89,6 +126,8 @@ fps_to_display = 0.0
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
+        if is_video_file:
+            print("\nEnd of video file.")
         break
     
     frame_count += 1
@@ -97,32 +136,73 @@ while cap.isOpened():
     frame_resized = cv2.resize(frame, (MODEL_IN_W, MODEL_IN_H), 
                                interpolation=cv2.INTER_AREA)
 
-    # === STEP 1: YOLO Detection ===
+    # STEP 1: YOLO Detection (no segmentation)
     results = yolo.track(frame_resized, persist=True, classes=[2], 
                          verbose=False, conf=0.3)
 
-    if results[0].masks is not None and len(results[0].masks) > 0:
-        # Create mask
-        all_masks = results[0].masks.data
-        combined_mask = torch.any(all_masks, dim=0).int()
-        mask_np = combined_mask.cpu().numpy().astype(np.uint8) # This is 0s and 1s
+    boxes = results[0].boxes
+    mask_np = None
+    frame_rgb = None
+    
+    if boxes is not None and len(boxes) > 0:
+        # STEP 2: EDGE-TAM Segmentation
+        if EDGETAM_AVAILABLE and edgetam_predictor is not None:
+            frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+            
+            try:
+                edgetam_predictor.set_image(frame_rgb)
+                
+                combined_mask = np.zeros((MODEL_IN_H, MODEL_IN_W), dtype=np.uint8)
+                
+                for box in boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                    box_prompt = np.array([x1, y1, x2, y2])
+                    
+                    masks, scores, _ = edgetam_predictor.predict(
+                        box=box_prompt,
+                        multimask_output=False
+                    )
+                    
+                    mask = masks[0] > 0
+                    combined_mask = np.maximum(combined_mask, mask.astype(np.uint8))
+                
+            except Exception as e:
+                print(f"⚠ EDGE-TAM segmentation error: {e}")
+                combined_mask = np.zeros((MODEL_IN_H, MODEL_IN_W), dtype=np.uint8)
+                for box in boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                    x1 = max(0, min(x1, MODEL_IN_W - 1))
+                    y1 = max(0, min(y1, MODEL_IN_H - 1))
+                    x2 = max(0, min(x2, MODEL_IN_W - 1))
+                    y2 = max(0, min(y2, MODEL_IN_H - 1))
+                    combined_mask[y1:y2, x1:x2] = 1
+        else:
+            combined_mask = np.zeros((MODEL_IN_H, MODEL_IN_W), dtype=np.uint8)
+            for box in boxes:
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                x1 = max(0, min(x1, MODEL_IN_W - 1))
+                y1 = max(0, min(y1, MODEL_IN_H - 1))
+                x2 = max(0, min(x2, MODEL_IN_W - 1))
+                y2 = max(0, min(y2, MODEL_IN_H - 1))
+                combined_mask[y1:y2, x1:x2] = 1
         
-        # Dilate for complete coverage
+        mask_np = combined_mask
+        
         kernel = np.ones((11, 11), np.uint8)
-        mask_np = cv2.dilate(mask_np, kernel, iterations=2) # Still 0s and 1s
+        mask_np = cv2.dilate(mask_np, kernel, iterations=2)
         
-        if mask_np.shape != (MODEL_IN_H, MODEL_IN_W):
-            mask_np = cv2.resize(mask_np, (MODEL_IN_W, MODEL_IN_H), 
-                                 interpolation=cv2.INTER_NEAREST)
+        mask_np_255 = (mask_np * 255).astype(np.uint8)
+        mask_smooth = cv2.GaussianBlur(mask_np_255, (15, 15), 0)
+        mask_smooth = np.ascontiguousarray(mask_smooth, dtype=np.uint8)
+    
+    if mask_np is not None and np.any(mask_np > 0):
         
-        # Smooth edges
-        mask_float = (mask_np * 255).astype(float) 
-        mask_blur = cv2.GaussianBlur(mask_float, (15, 15), 0) 
-        mask_smooth = mask_blur.astype(np.uint8)
+        if frame_rgb is None:
+            frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
         
-        frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
-        
-        # === STEP 2: LaMa Spatial Inpainting ===
+        # STEP 3: LaMa Spatial Inpainting 
         if USE_LAMA:
             try:
                 frame_rgb_np = np.ascontiguousarray(frame_rgb, dtype=np.uint8)
@@ -131,58 +211,21 @@ while cap.isOpened():
                 
                 lama_output = lama(frame_rgb_np, mask_binary_np)
                 
-                stage1_result = cv2.cvtColor(np.ascontiguousarray(lama_output, dtype=np.uint8), 
-                                             cv2.COLOR_RGB2BGR)
+                lama_output_np = np.ascontiguousarray(lama_output, dtype=np.uint8)
+                stage1_result = cv2.cvtColor(lama_output_np, cv2.COLOR_RGB2BGR)
             except Exception as e:
                 print(f"⚠ LaMa error: {e}")
                 stage1_result = frame_resized
         else:
-            # Skip LaMa
             mask_3ch = (mask_np > 0)[..., None]
             masked_frame = frame_rgb.copy()
             masked_frame[mask_3ch.squeeze()] = 0
             stage1_result = cv2.cvtColor(masked_frame, cv2.COLOR_RGB2BGR)
         
-        # === STEP 3: FuseFormer Temporal Refinement ===
-        stage2_result = stage1_result.copy()
-        
-        if USE_FUSEFORMER:
-            stage1_rgb = cv2.cvtColor(stage1_result, cv2.COLOR_BGR2RGB)
-            frame_buffer.append(stage1_rgb)
-            
-            if len(frame_buffer) >= TEMPORAL_WINDOW:
-                frames_stack = np.stack(list(frame_buffer), axis=0)
-                frames_tensor = torch.from_numpy(frames_stack).permute(0, 3, 1, 2).float()
-                frames_tensor = (frames_tensor / 127.5) - 1.0
-                frames_tensor = frames_tensor.unsqueeze(0).to(DEVICE)
-                
-                try:
-                    with torch.no_grad():
-                        output, former_attn = fuseformer(frames_tensor, former_attn)
-                    
-                    b_t, c, h, w = output.shape
-                    output = output.view(1, TEMPORAL_WINDOW, c, h, w)
-                    last_frame = output[0, -1]
-                    
-                    last_frame = torch.clamp(last_frame, -1, 1)
-                    last_frame = (last_frame + 1.0) / 2.0
-                    
-                    refined_np = last_frame.permute(1, 2, 0).cpu().numpy()
-                    refined_np = (refined_np * 255).astype(np.uint8)
-                    stage2_result = cv2.cvtColor(refined_np, cv2.COLOR_RGB2BGR)
-                    
-                    mask_blend = cv2.GaussianBlur(mask_blur / 255.0, (21, 21), 0)[..., None]
-                    
-                    stage2_result = (stage2_result * mask_blend + 
-                                     stage1_result * (1 - mask_blend)).astype(np.uint8)
-                    
-                except Exception as e:
-                    print(f"⚠ FuseFormer error: {e}")
-                    stage2_result = stage1_result
-        
-        final_frame = stage2_result
-        
-        # === Debug Visualization ===
+        final_frame = stage1_result
+
+        # debug mode
+        # display the original, mask, LaMa output, and difference
         if DEBUG_MODE:
             h_d, w_d = MODEL_IN_H // 2, MODEL_IN_W // 2
             
@@ -193,7 +236,6 @@ while cap.isOpened():
                                            cv2.resize(mask_vis, (w_d, h_d)), 0.4, 0)
             
             debug_lama = cv2.resize(stage1_result, (w_d, h_d))
-            debug_fuseformer = cv2.resize(stage2_result, (w_d, h_d))
             debug_final = cv2.resize(final_frame, (w_d, h_d))
             
             diff_lama = cv2.absdiff(debug_lama, debug_original)
@@ -201,7 +243,7 @@ while cap.isOpened():
                                          cv2.COLORMAP_HOT)
             
             top_row = np.hstack([debug_original, mask_overlay, debug_lama])
-            bottom_row = np.hstack([diff_lama, debug_fuseformer, debug_final])
+            bottom_row = np.hstack([diff_lama, debug_final])
             debug_view = np.vstack([top_row, bottom_row])
             
             font = cv2.FONT_HERSHEY_SIMPLEX
@@ -213,58 +255,38 @@ while cap.isOpened():
             cv2.putText(debug_view, f"3.LaMa {'ON' if USE_LAMA else 'OFF'}", (2*w_d+5, 15), 
                         font, font_scale, (0, 255, 0) if USE_LAMA else (100, 100, 100), thickness)
             cv2.putText(debug_view, "4.Difference", (5, h_d+15), font, font_scale, (0, 255, 0), thickness)
-            cv2.putText(debug_view, f"5.FuseFormer {'ON' if USE_FUSEFORMER else 'OFF'}", 
-                        (w_d+5, h_d+15), font, font_scale, 
-                        (0, 255, 0) if USE_FUSEFORMER else (100, 100, 100), thickness)
-            cv2.putText(debug_view, "6.Final", (2*w_d+5, h_d+15), font, font_scale, (0, 255, 0), thickness)
-            buffer_status = f"Buffer: {len(frame_buffer)}/{TEMPORAL_WINDOW}"
-            cv2.putText(debug_view, buffer_status, (5, h_d*2-10), 
-                        font, 0.35, (255, 255, 0), 1)
+            cv2.putText(debug_view, "5.Final", (w_d+5, h_d+15), font, font_scale, (0, 255, 0), thickness)
             
             cv2.imshow("Debug View", debug_view)
         
     else:
-        # No detection
         final_frame = frame_resized
-        if USE_FUSEFORMER:
-            frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
-            frame_buffer.append(frame_rgb)
     
-    # === Main Display ===
     final_display = cv2.resize(final_frame, (original_w, original_h))
     
-    
-    # --- 3. CALCULATE AND DISPLAY FPS ---
-    
-    # Increment frame counter
     fps_frame_counter += 1
     current_time = time.time()
     elapsed_time = current_time - fps_start_time
 
-    # Update FPS calculation every second
     if elapsed_time > 1.0:
         fps_to_display = fps_frame_counter / elapsed_time
-        fps_frame_counter = 0  # Reset frame counter
-        fps_start_time = current_time  # Reset start time
+        fps_frame_counter = 0
+        fps_start_time = current_time
 
-    # Display FPS
     cv2.putText(final_display, f"FPS: {fps_to_display:.1f}", (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
     
-    # Display pipeline status
-    status_text = f"LaMa: {'ON' if USE_LAMA else 'OFF'} | FuseFormer: {'ON' if USE_FUSEFORMER else 'OFF'}"
+    status_text = f"LaMa: {'ON' if USE_LAMA else 'OFF'}"
     cv2.putText(final_display, status_text, (10, 65),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
     
-    # Display detection status
-    detection_status = "Inpainting" if (results[0].masks is not None and len(results[0].masks) > 0) else "No Detection"
+    detection_status = "Inpainting" if (boxes is not None and len(boxes) > 0) else "No Detection"
     cv2.putText(final_display, detection_status, (10, 95),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-    
     cv2.imshow("Hybrid Inpainting", final_display)
     
-    # === Keyboard Controls ===
+    #  keyboard controls
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
         break
@@ -276,9 +298,6 @@ while cap.isOpened():
     elif key == ord('1'):
         USE_LAMA = not USE_LAMA
         print(f"LaMa: {USE_LAMA}")
-    elif key == ord('2'):
-        USE_FUSEFORMER = not USE_FUSEFORMER
-        print(f"FuseFormer: {USE_FUSEFORMER}")
     elif key == ord('s'):
         filename = f'hybrid_inpaint_frame_{frame_count}.jpg'
         cv2.imwrite(filename, final_display)
